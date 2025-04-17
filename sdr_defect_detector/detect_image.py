@@ -83,8 +83,8 @@ def main():
     args = parser.parse_args()
     
     # Load model - CHANGE PATH TO YOUR MODEL FILE
-    model_path = "C:\\Users\\wbszy\\code_projects\\Soundcheck\\defect_detection_model.pkl"
-    model, threshold, model_data = load_model(model_path)
+    #model_path = "C:\\Users\\wbszy\\code_projects\\Soundcheck\\defect_detection_model.pkl"
+    model, threshold, model_data = load_model(args.model)
     
     # Override threshold if specified
     if args.threshold is not None:
