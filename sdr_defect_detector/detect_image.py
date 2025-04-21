@@ -24,7 +24,7 @@ def load_model(filename='defect_detection_model.pkl'):
     return model, threshold, model_data
 
 def detect_defects_in_image(image, model, threshold, window_size=8, overlap=0.5):
-    """Detect defects in an image"""
+    """Detect defects in an image with improved precision"""
     # Ensure image is properly normalized
     if image.max() > 1.0:
         norm_image = normalize_image(image)
@@ -39,34 +39,87 @@ def detect_defects_in_image(image, model, threshold, window_size=8, overlap=0.5)
     
     # Extract features
     features = []
+    raw_features = []  # Store raw feature values for threshold adjustments
+    
     for window, pos in zip(windows, positions):
         window_features = extract_window_features(window, norm_image, pos)
         features.append(window_features)
+        raw_features.append(window_features)
     
     # Get predictions
     if len(features) > 0:
         X = np.array(features)
+        raw_X = np.array(raw_features)
         probas = model.predict_proba(X)[:, 1]
         
-        # Find defective elements
+        # Find defective elements with enhanced precision
         defect_positions = []
         element_probas = {}
         
-        # Handle overlapping windows
-        for (start, end), proba in zip(positions, probas):
-            for pos in range(start, end):
-                if pos not in element_probas or proba > element_probas[pos]:
-                    element_probas[pos] = proba
+        # Feature indices for adjustment (based on feature importance)
+        # These should be adjusted based on your actual feature importance
+        horizontal_uniformity_index = 16  # Main pattern uniformity feature
+        brightness_percentile_index = 5   # 90th percentile brightness
+        median_brightness_index = 3       # Median brightness
+        edge_distance_index = -1          # Position from edge (last contextual feature)
         
-        # Get positions with confidence above threshold
-        for pos, conf in element_probas.items():
-            if conf >= threshold:
+        for i, ((start, end), proba) in enumerate(zip(positions, probas)):
+            adjusted_proba = proba
+            
+            # Only apply adjustments if we have enough features
+            if raw_X.shape[1] > max(horizontal_uniformity_index, brightness_percentile_index, 
+                                  median_brightness_index, abs(edge_distance_index)):
+                
+                # Penalize probabilities for suspicious feature values
+                if raw_X[i, horizontal_uniformity_index] < 0.05:  # Unusually uniform
+                    adjusted_proba *= 0.8  # Reduce confidence
+                    
+                # Adjust for very bright elements (often false positives)
+                if raw_X[i, brightness_percentile_index] > 0.9:  # Very bright
+                    adjusted_proba *= 0.85  # Reduce confidence
+                
+                # Adjust for edge proximity (if feature available)
+                if len(raw_X[i]) > abs(edge_distance_index) and raw_X[i][edge_distance_index] < 0.2:  # Close to edge
+                    adjusted_proba *= 0.9  # Reduce confidence
+            
+            # Apply to each position in the window
+            for pos in range(start, end):
+                if pos not in element_probas or adjusted_proba > element_probas[pos]:
+                    element_probas[pos] = adjusted_proba
+        
+        # Apply position-based threshold adjustments
+        image_width = roi.shape[1]
+        
+        for pos, conf in list(element_probas.items()):
+            # Determine adjusted threshold based on position
+            if pos < 5 or pos > image_width - 5:  # Edge position
+                adjusted_threshold = threshold * 1.2  # Higher threshold at edges
+            elif pos < 10 or pos > image_width - 10:  # Near edge
+                adjusted_threshold = threshold * 1.1  # Slightly higher threshold near edges
+            else:
+                adjusted_threshold = threshold
+                
+            if conf >= adjusted_threshold:
                 defect_positions.append((pos, conf))
         
-        # Sort by position
-        defect_positions.sort(key=lambda x: x[0])
-        
-        return defect_positions
+        # Post-processing to remove isolated detections (likely false positives)
+        if defect_positions:
+            filtered_positions = []
+            defect_positions.sort(key=lambda x: x[0])  # Sort by position
+            
+            for i, (pos, conf) in enumerate(defect_positions):
+                # Check if this is an isolated detection
+                is_isolated = True
+                for j, (other_pos, _) in enumerate(defect_positions):
+                    if i != j and abs(pos - other_pos) <= 3:  # Within 3 elements
+                        is_isolated = False
+                        break
+                
+                # Keep non-isolated detections or very high confidence ones
+                if not is_isolated or conf > threshold * 1.5:
+                    filtered_positions.append((pos, conf))
+            
+            return filtered_positions
     
     return []
 
@@ -79,11 +132,12 @@ def main():
     parser.add_argument('--window_size', type=int, default=8, help='Window size for feature extraction')
     parser.add_argument('--overlap', type=float, default=0.5, help='Window overlap ratio')
     parser.add_argument('--threshold', type=float, help='Custom threshold (overrides saved threshold)')
+    parser.add_argument('--precision_mode', action='store_true', 
+                      help='Enable precision mode (stricter detection criteria)')
     
     args = parser.parse_args()
     
-    # Load model - CHANGE PATH TO YOUR MODEL FILE
-    #model_path = "C:\\Users\\wbszy\\code_projects\\Soundcheck\\defect_detection_model.pkl"
+    # Load model
     model, threshold, model_data = load_model(args.model)
     
     # Override threshold if specified
@@ -151,6 +205,14 @@ def main():
         vis_image_base = (image * 255).astype(np.uint8)
     
     vis_image = visualize_defects(vis_image_base, defect_positions)
+    
+    # Overlay ground truth if available
+    if true_defects is not None:
+        height = vis_image.shape[0]
+        for pos in true_defects:
+            # Draw green ground truth markers
+            cv2.line(vis_image, (pos, 0), (pos, height//8), (0, 255, 0), 1)
+            cv2.circle(vis_image, (pos, height//6), 3, (0, 255, 0), 1)
     
     if args.output:
         cv2.imwrite(args.output, vis_image)

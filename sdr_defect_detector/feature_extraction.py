@@ -56,18 +56,41 @@ def extract_brightness_features(window):
     else:
         features.append(0)
     
+    # Add coefficient of variation
+    if np.mean(window) > 0:
+        features.append(np.std(window) / (np.mean(window) + 1e-8))
+    else:
+        features.append(0)
+    
+    # Add skewness
+    if len(flat_window) > 0:
+        mean = np.mean(flat_window)
+        std = np.std(flat_window)
+        if std > 0:
+            skewness = np.mean(((flat_window - mean) / std) ** 3)
+            features.append(skewness)
+        else:
+            features.append(0)
+    else:
+        features.append(0)
+    
     return features
 
 def extract_pattern_features(window):
-    """Extract features related to reverberation pattern"""
+    """Extract features related to reverberation pattern with improved precision"""
     features = []
     height, width = window.shape
     
     # Vertical profile
     vertical_profile = np.mean(window, axis=1)
     
-    # Find peaks (reverberation bands)
-    peaks, _ = find_peaks(vertical_profile, height=np.std(vertical_profile))
+    # Find peaks (reverberation bands) with improved parameters
+    peaks, properties = find_peaks(
+        vertical_profile, 
+        height=np.mean(vertical_profile) + 0.5 * np.std(vertical_profile),
+        distance=2,  # Minimum distance between peaks
+        prominence=np.std(vertical_profile) * 0.5  # Added prominence threshold
+    )
     
     features.append(len(peaks))
     
@@ -93,21 +116,45 @@ def extract_pattern_features(window):
     else:
         features.extend([0, 0, 0, 0])
     
-    # Horizontal uniformity
+    # Improved horizontal uniformity
     row_variations = np.std(window, axis=1)
     features.append(np.mean(row_variations))
+    
+    # Add normalized row variations
+    if np.mean(window) > 0:
+        norm_row_variations = np.std(window, axis=1) / (np.mean(window) + 1e-8)
+        features.append(np.mean(norm_row_variations))
+    else:
+        features.append(0)
+    
+    # Add local consistency feature
+    local_consistency = []
+    for i in range(1, height-1):
+        consistency = np.corrcoef(window[i-1], window[i])[0,1]
+        if np.isnan(consistency):
+            consistency = 0
+        local_consistency.append(consistency)
+    
+    features.append(np.mean(local_consistency) if local_consistency else 0)
+    
+    # Add peak regularity (coefficient of variation of peak distances)
+    if len(peaks) > 2:
+        peak_distances = np.diff(peaks)
+        features.append(np.std(peak_distances) / (np.mean(peak_distances) + 1e-8))
+    else:
+        features.append(0)
     
     return features
 
 def extract_contextual_features(window, full_image, window_position):
-    """Extract features comparing window to surrounding regions"""
+    """Extract enhanced contextual features comparing window to surroundings"""
     features = []
     height, width = window.shape
     start_col, end_col = window_position
     
-    # Get regions to left and right
-    left_width = min(width, start_col)
-    right_width = min(width, full_image.shape[1] - end_col)
+    # Get regions to left and right (expanded range)
+    left_width = min(width*2, start_col)
+    right_width = min(width*2, full_image.shape[1] - end_col)
     
     left_region = None
     if left_width > 0:
@@ -151,6 +198,45 @@ def extract_contextual_features(window, full_image, window_position):
     else:
         features.append(0)
     
+    #standard deviation ratio
+    window_std = np.std(window)
+    
+    if left_region is not None and np.size(left_region) > 0:
+        left_std = np.std(left_region)
+        features.append(window_std / (left_std + 1e-8))
+    else:
+        features.append(1.0)
+    
+    if right_region is not None and np.size(right_region) > 0:
+        right_std = np.std(right_region)
+        features.append(window_std / (right_std + 1e-8))
+    else:
+        features.append(1.0)
+    
+    # Pattern consistency with neighbors
+    window_pattern = np.mean(window, axis=1)  # Vertical pattern
+    
+    if left_region is not None and np.size(left_region) > 0:
+        left_pattern = np.mean(left_region, axis=1)
+        corr = np.corrcoef(window_pattern, left_pattern)[0,1]
+        features.append(0 if np.isnan(corr) else corr)
+    else:
+        features.append(0)
+    
+    if right_region is not None and np.size(right_region) > 0:
+        right_pattern = np.mean(right_region, axis=1)
+        corr = np.corrcoef(window_pattern, right_pattern)[0,1]
+        features.append(0 if np.isnan(corr) else corr)
+    else:
+        features.append(0)
+    
+    # Add position-based feature (distance from edge)
+    image_width = full_image.shape[1]
+    center_pos = (start_col + end_col) / 2
+    # Normalize distance from edge (closer to 1 means closer to edge)
+    edge_distance = min(center_pos, image_width - center_pos) / (image_width / 2)
+    features.append(edge_distance)
+    
     return features
 
 def extract_texture_features(window):
@@ -181,7 +267,12 @@ def extract_texture_features(window):
         correlation = graycoprops(glcm, 'correlation').mean()
         
         features.extend([contrast, dissimilarity, homogeneity, energy, correlation])
+        
+        # Add ASM (Angular Second Moment)
+        asm = graycoprops(glcm, 'ASM').mean()
+        features.append(asm)
+        
     except:
-        features.extend([0, 0, 0, 0, 0])
+        features.extend([0, 0, 0, 0, 0, 0])
     
     return features

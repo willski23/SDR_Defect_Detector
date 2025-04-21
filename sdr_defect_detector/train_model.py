@@ -5,11 +5,12 @@ from sklearn.model_selection import train_test_split
 import cv2
 import os
 import pickle
+import matplotlib.pyplot as plt
+from collections import Counter
 
 # Import from our modules
 from preprocessing import normalize_image, extract_roi, create_windows
 from feature_extraction import extract_window_features
-from model import train_defect_detection_model
 from evaluation import determine_optimal_threshold, evaluate_model, evaluate_element_level_performance
 from visualization import visualize_feature_importance
 
@@ -41,6 +42,107 @@ def load_data_from_hdf5(filepath):
         
     return images, dead_elements, filenames
 
+def train_defect_detection_model(X_train, y_train, precision_focus=0.7):
+    """Train and optimize defect detection model with focus on precision"""
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.metrics import make_scorer, precision_score, recall_score, f1_score
+    from imblearn.over_sampling import SMOTE
+    from imblearn.under_sampling import RandomUnderSampler
+    from imblearn.pipeline import Pipeline
+    
+    # Check for class imbalance
+    class_counts = Counter(y_train)
+    print(f"Class distribution: {class_counts}")
+    
+    # Calculate class weights to emphasize precision
+    # Higher weight for negative class reduces false positives
+    weight_ratio = 1.0 + precision_focus  # Adjust negative class weight
+    class_weight = {
+        0: weight_ratio,  # Increased weight for negative class
+        1: 1.0  # Normal weight for positive class
+    }
+    
+    # Handle class imbalance with SMOTE but slightly under-sample the minority class
+    if class_counts[1] / sum(class_counts.values()) < 0.3:
+        # Create a pipeline with both over and under sampling
+        over = SMOTE(sampling_strategy=0.2, random_state=42)  # Less aggressive SMOTE
+        under = RandomUnderSampler(sampling_strategy=0.3, random_state=42)
+        
+        steps = [('over', over), ('under', under)]
+        pipeline = Pipeline(steps=steps)
+        
+        X_train, y_train = pipeline.fit_resample(X_train, y_train)
+        print(f"After resampling: {Counter(y_train)}")
+    
+    # Model with precision-focused parameters
+    rf = RandomForestClassifier(
+        n_estimators=500,  # More trees for better generalization
+        max_depth=15,      # Reduced to avoid overfitting
+        min_samples_split=8,  # Increased to reduce false positives
+        min_samples_leaf=4,   # Increased to reduce false positives
+        class_weight=class_weight,
+        criterion='gini',  # Try 'entropy' as alternative
+        n_jobs=-1,
+        random_state=42
+    )
+    
+    # Custom scorer that weights precision more than recall
+    def precision_focused_f1(y_true, y_pred):
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        
+        # Weighted harmonic mean with emphasis on precision
+        beta = 0.5  # Beta < 1 gives more weight to precision
+        return (1 + beta**2) * (prec * rec) / ((beta**2 * prec) + rec) if (prec + rec) > 0 else 0
+    
+    custom_scorer = make_scorer(precision_focused_f1)
+    
+    # Hyperparameter optimization
+    param_grid = {
+        'n_estimators': [400, 500, 600],
+        'max_depth': [12, 15, 18],
+        'min_samples_split': [6, 8, 10]
+    }
+    
+    grid_search = GridSearchCV(
+        rf, param_grid, cv=5, scoring=custom_scorer, n_jobs=-1
+    )
+    
+    # Train the model
+    print("Training model with precision focus...")
+    grid_search.fit(X_train, y_train)
+    
+    # Get best model
+    best_model = grid_search.best_estimator_
+    print(f"Best parameters: {grid_search.best_params_}")
+    
+    # Feature importance analysis
+    importances = best_model.feature_importances_
+    indices = np.argsort(importances)[::-1]
+    
+    print("Top 10 features:")
+    for f in range(min(10, len(importances))):
+        print(f"{f+1}. Feature {indices[f]} ({importances[indices[f]]:.4f})")
+    
+    return best_model
+
+def calibrate_probabilities(model, X_val, y_val):
+    """Calibrate model probability outputs for more reliable thresholding"""
+    from sklearn.calibration import CalibratedClassifierCV
+    
+    # Calibrate model probabilities
+    calibrated_model = CalibratedClassifierCV(
+        model, 
+        method='isotonic',  # or 'sigmoid'
+        cv='prefit'  # Use prefit model
+    )
+    
+    # Fit the calibrator
+    calibrated_model.fit(X_val, y_val)
+    
+    return calibrated_model
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train Ultrasound Transducer Defect Detection Model')
@@ -48,13 +150,14 @@ def main():
     parser.add_argument('--output', type=str, default='defect_detection_model.pkl', help='Output model filename')
     parser.add_argument('--window_size', type=int, default=8, help='Window size for feature extraction')
     parser.add_argument('--overlap', type=float, default=0.5, help='Window overlap ratio')
+    parser.add_argument('--precision_focus', type=float, default=0.7, 
+                       help='Focus on precision (0-1, higher values prioritize precision over recall)')
     
     args = parser.parse_args()
     
     # Load data from HDF5 file
     print("Loading dataset from HDF5 file...")
-    dataset_path = "C:\\Users\\wbszy\\code_projects\\Soundcheck\\data\\processed\\dataset.h5"
-    images, dead_elements, filenames = load_data_from_hdf5(dataset_path)
+    images, dead_elements, filenames = load_data_from_hdf5(args.data_file)
     
     print(f"Dataset: {len(images)} images")
     
@@ -108,12 +211,12 @@ def main():
     train_labels = []
     
     for img_idx, (image, defects) in enumerate(zip(train_images, train_defects)):
-        # Note: HDF5 data may already be normalized, but we'll ensure consistency
-        if image.max() > 1.0:  # Check if normalization is needed
+        # Preprocess
+        if image.max() > 1.0:
             norm_image = normalize_image(image)
         else:
-            norm_image = (image * 255).astype(np.uint8)  # Scale to 0-255 range
-        
+            norm_image = (image * 255).astype(np.uint8)
+            
         roi = extract_roi(norm_image)
         
         # Create windows
@@ -134,7 +237,7 @@ def main():
     
     # Train model
     print(f"Training model on {len(X_train)} windows...")
-    model = train_defect_detection_model(X_train, y_train)
+    model = train_defect_detection_model(X_train, y_train, precision_focus=args.precision_focus)
     
     # Extract validation features
     print("Extracting features from validation set...")
@@ -164,6 +267,14 @@ def main():
     # Determine optimal threshold
     print("Determining optimal threshold...")
     optimal_threshold = determine_optimal_threshold(model, X_val, y_val)
+    
+    # Calibrate model probabilities
+    print("Calibrating model probabilities...")
+    calibrated_model = calibrate_probabilities(model, X_val, y_val)
+    
+    # Re-determine optimal threshold with calibrated model
+    print("Re-determining optimal threshold with calibrated model...")
+    optimal_threshold = determine_optimal_threshold(calibrated_model, X_val, y_val)
     
     # Evaluate on test set
     print("Extracting features from test set...")
@@ -195,12 +306,12 @@ def main():
     
     # Evaluate window-level performance
     print("Evaluating window-level performance...")
-    window_metrics = evaluate_model(model, optimal_threshold, X_test, y_test)
+    window_metrics = evaluate_model(calibrated_model, optimal_threshold, X_test, y_test)
     
     # Evaluate element-level performance
     print("Evaluating element-level performance...")
     element_metrics = evaluate_element_level_performance(
-        model, 
+        calibrated_model, 
         optimal_threshold, 
         test_images, 
         test_defects,
@@ -209,15 +320,15 @@ def main():
     )
     
     # Visualize feature importance
-    fig = visualize_feature_importance(model)
+    fig = visualize_feature_importance(calibrated_model)
     fig.savefig('feature_importance.png')
     
-    # Save model
+    # Save calibrated model
     metrics = {
         'window_level': window_metrics,
         'element_level': element_metrics
     }
-    save_model(model, optimal_threshold, metrics, args.output)
+    save_model(calibrated_model, optimal_threshold, metrics, args.output)
     
     print("Training complete!")
 
