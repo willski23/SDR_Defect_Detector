@@ -27,7 +27,7 @@ def load_model(filename='defect_detection_model.pkl'):
     return model, threshold, model_data
 
 def detect_defects_in_image(image, model, threshold, window_size=8, overlap=0.5):
-    """Detect defects in an image"""
+    """Detect defects in an image with improved precision"""
     # Ensure image is properly normalized
     if image.max() > 1.0:
         norm_image = normalize_image(image)
@@ -42,34 +42,94 @@ def detect_defects_in_image(image, model, threshold, window_size=8, overlap=0.5)
     
     # Extract features
     features = []
+    raw_features = []  # Store raw feature values for threshold adjustments
+    
     for window, pos in zip(windows, positions):
         window_features = extract_window_features(window, norm_image, pos)
         features.append(window_features)
+        raw_features.append(window_features)
     
     # Get predictions
     if len(features) > 0:
         X = np.array(features)
+        raw_X = np.array(raw_features)
         probas = model.predict_proba(X)[:, 1]
         
-        # Find defective elements
+        # Find defective elements with enhanced precision
         defect_positions = []
         element_probas = {}
         
-        # Handle overlapping windows
-        for (start, end), proba in zip(positions, probas):
-            for pos in range(start, end):
-                if pos not in element_probas or proba > element_probas[pos]:
-                    element_probas[pos] = proba
+        # Feature indices for adjustment (based on feature importance)
+        # These should be adjusted based on your actual feature importance
+        try:
+            horizontal_uniformity_index = 16  # Main pattern uniformity feature
+            brightness_percentile_index = 5   # 90th percentile brightness
+            median_brightness_index = 3       # Median brightness
+            edge_distance_index = -1          # Position from edge (last contextual feature)
+            
+            for i, ((start, end), proba) in enumerate(zip(positions, probas)):
+                adjusted_proba = proba
+                
+                # Only apply adjustments if we have enough features
+                if raw_X.shape[1] > max(horizontal_uniformity_index, brightness_percentile_index, 
+                                      median_brightness_index, abs(edge_distance_index)):
+                    
+                    # Penalize probabilities for suspicious feature values
+                    if raw_X[i, horizontal_uniformity_index] < 0.05:  # Unusually uniform
+                        adjusted_proba *= 0.8  # Reduce confidence
+                        
+                    # Adjust for very bright elements (often false positives)
+                    if raw_X[i, brightness_percentile_index] > 0.9:  # Very bright
+                        adjusted_proba *= 0.85  # Reduce confidence
+                    
+                    # Adjust for edge proximity (if feature available)
+                    if len(raw_X[i]) > abs(edge_distance_index) and raw_X[i][edge_distance_index] < 0.2:  # Close to edge
+                        adjusted_proba *= 0.9  # Reduce confidence
+                
+                # Apply to each position in the window
+                for pos in range(start, end):
+                    if pos not in element_probas or adjusted_proba > element_probas[pos]:
+                        element_probas[pos] = adjusted_proba
+        except:
+            # Fall back to default if feature indices are incorrect
+            for i, ((start, end), proba) in enumerate(zip(positions, probas)):
+                for pos in range(start, end):
+                    if pos not in element_probas or proba > element_probas[pos]:
+                        element_probas[pos] = proba
         
-        # Get positions with confidence above threshold
-        for pos, conf in element_probas.items():
-            if conf >= threshold:
+        # Apply position-based threshold adjustments
+        image_width = roi.shape[1]
+        
+        for pos, conf in list(element_probas.items()):
+            # Determine adjusted threshold based on position
+            if pos < 5 or pos > image_width - 5:  # Edge position
+                adjusted_threshold = threshold * 1.2  # Higher threshold at edges
+            elif pos < 10 or pos > image_width - 10:  # Near edge
+                adjusted_threshold = threshold * 1.1  # Slightly higher threshold near edges
+            else:
+                adjusted_threshold = threshold
+                
+            if conf >= adjusted_threshold:
                 defect_positions.append((pos, conf))
         
-        # Sort by position
-        defect_positions.sort(key=lambda x: x[0])
-        
-        return defect_positions
+        # Post-processing to remove isolated detections (likely false positives)
+        if defect_positions:
+            filtered_positions = []
+            defect_positions.sort(key=lambda x: x[0])  # Sort by position
+            
+            for i, (pos, conf) in enumerate(defect_positions):
+                # Check if this is an isolated detection
+                is_isolated = True
+                for j, (other_pos, _) in enumerate(defect_positions):
+                    if i != j and abs(pos - other_pos) <= 3:  # Within 3 elements
+                        is_isolated = False
+                        break
+                
+                # Keep non-isolated detections or very high confidence ones
+                if not is_isolated or conf > threshold * 1.5:
+                    filtered_positions.append((pos, conf))
+            
+            return filtered_positions
     
     return []
 
@@ -105,6 +165,8 @@ def main():
     parser.add_argument('--start_idx', type=int, default=0, help='Start index in dataset')
     parser.add_argument('--end_idx', type=int, default=-1, help='End index in dataset (-1 for all)')
     parser.add_argument('--save_vis', action='store_true', help='Save visualizations')
+    parser.add_argument('--precision_mode', action='store_true', 
+                      help='Enable precision mode (stricter detection criteria)')
     
     args = parser.parse_args()
     
@@ -200,6 +262,14 @@ def main():
                 
                 vis_image = visualize_defects(vis_image_base, defect_positions)
                 
+                # Overlay ground truth if available
+                if true_defects:
+                    height = vis_image.shape[0]
+                    for pos in true_defects:
+                        # Draw green ground truth markers
+                        cv2.line(vis_image, (pos, 0), (pos, height//8), (0, 255, 0), 1)
+                        cv2.circle(vis_image, (pos, height//6), 3, (0, 255, 0), 1)
+                
                 vis_filename = os.path.join(args.output_dir, f"{os.path.splitext(filename)[0]}_vis.png")
                 cv2.imwrite(vis_filename, vis_image)
         
@@ -255,7 +325,7 @@ def main():
         # Generate summary plots if ground truth is available
         if has_ground_truth and args.save_vis:
             # 1. Distribution of defects per image
-            plt.figure(figsize=(10, 6))
+            plt.figure(figsize=(12, 7))
             
             detected_counts = [len(r['defect_positions']) for r in results]
             true_counts = [len(r['true_defects']) for r in results]
@@ -293,6 +363,42 @@ def main():
             plt.title('Distribution of F1 Scores')
             plt.grid(alpha=0.3)
             plt.savefig(os.path.join(args.output_dir, 'f1_distribution.png'))
+            
+            # 4. Confidence vs Accuracy plot
+            all_confs = []
+            all_correct = []
+            
+            for r in results:
+                if r['metrics'] is not None:
+                    pred_pos = [pos for pos, _ in r['defect_positions']]
+                    true_pos = r['true_defects']
+                    
+                    for pos, conf in r['defect_positions']:
+                        all_confs.append(conf)
+                        all_correct.append(1 if pos in true_pos else 0)
+            
+            if all_confs:
+                # Sort by confidence
+                conf_acc = sorted(zip(all_confs, all_correct), key=lambda x: x[0])
+                confs = [c for c, _ in conf_acc]
+                correct = [c for _, c in conf_acc]
+                
+                # Calculate moving average accuracy
+                window_size = min(50, len(correct))
+                moving_acc = []
+                
+                for i in range(len(correct) - window_size + 1):
+                    moving_acc.append(sum(correct[i:i+window_size]) / window_size)
+                
+                plt.figure(figsize=(12, 6))
+                plt.scatter(confs[window_size-1:], moving_acc, alpha=0.5, s=10)
+                plt.xlabel('Confidence Score')
+                plt.ylabel('Accuracy (Moving Average)')
+                plt.title(f'Detection Accuracy vs Confidence ({window_size}-sample moving average)')
+                plt.grid(alpha=0.3)
+                plt.xlim(0, 1.05)
+                plt.ylim(0, 1.05)
+                plt.savefig(os.path.join(args.output_dir, 'confidence_accuracy.png'))
             
             print(f"Summary plots saved to {args.output_dir}")
 

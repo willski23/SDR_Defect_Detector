@@ -28,7 +28,18 @@ def visualize_defects(image, defect_positions):
 
 def visualize_feature_importance(model, feature_names=None):
     """Visualize feature importance from model"""
-    importances = model.feature_importances_
+    # For calibrated models, access the base estimator
+    if hasattr(model, 'base_estimator'):
+        # For calibrated models, get the first calibrated estimator
+        if hasattr(model, 'calibrated_classifiers_'):
+            base_model = model.calibrated_classifiers_[0].base_estimator
+        else:
+            base_model = model.base_estimator
+    else:
+        base_model = model
+    
+    # Now get feature importances from the base model
+    importances = base_model.feature_importances_
     indices = np.argsort(importances)[::-1]
     
     # If feature names are not provided, use indices

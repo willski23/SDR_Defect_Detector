@@ -320,7 +320,7 @@ def main():
     )
     
     # Visualize feature importance
-    fig = visualize_feature_importance(calibrated_model)
+    fig = visualize_feature_importance(model)
     fig.savefig('feature_importance.png')
     
     # Save calibrated model
