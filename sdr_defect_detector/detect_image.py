@@ -4,6 +4,8 @@ import h5py
 import cv2
 import pickle
 import os
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
 
 from preprocessing import normalize_image, extract_roi, create_windows
 from feature_extraction import extract_window_features
@@ -23,7 +25,108 @@ def load_model(filename='defect_detection_model.pkl'):
     
     return model, threshold, model_data
 
-def detect_defects_in_image(image, model, threshold, window_size=8, overlap=0.5):
+def extract_transducer_profile(image):
+    """Extract transducer intensity profile for advanced detection logic"""
+    # Get top portion for analysis
+    height, width = image.shape
+    top_section = image[:min(int(height * 0.15), 30), :]
+    
+    # Create intensity profile
+    profile = np.mean(top_section, axis=0)
+    
+    # Normalize profile
+    profile = (profile - np.min(profile)) / (np.max(profile) - np.min(profile) + 1e-8)
+    
+    return profile
+
+def optimize_position_detection(positions, confidences, profile, window_size=8):
+    """Refine defect positions using signal profile analysis"""
+    refined_positions = []
+    
+    for position, confidence in zip(positions, confidences):
+        # Extract profile segment centered at position
+        half_window = window_size // 2
+        start = max(0, position - half_window)
+        end = min(len(profile), position + half_window + 1)
+        
+        if start >= end or start >= len(profile) or end <= 0:
+            continue
+            
+        segment = profile[start:end]
+        
+        # Look for local minima in the segment
+        if len(segment) > 2:
+            # Find local minimum within window
+            if position - start < len(segment):
+                local_min_idx = start + np.argmin(segment)
+                
+                # Add refined position with original confidence
+                refined_positions.append((local_min_idx, confidence))
+            else:
+                # Fallback to original position
+                refined_positions.append((position, confidence))
+        else:
+            # Fallback to original position
+            refined_positions.append((position, confidence))
+    
+    return refined_positions
+
+def analyze_pattern_consistency(image, positions):
+    """Analyze pattern consistency to filter out false positives"""
+    height, width = image.shape
+    roi_height = min(int(height * 0.3), 100)
+    roi = image[:roi_height, :]
+    
+    # Create vertical profiles for all columns
+    profiles = []
+    for col in range(width):
+        if col < roi.shape[1]:
+            profiles.append(roi[:, col])
+    
+    # Calculate correlation between columns
+    valid_positions = []
+    
+    for pos, conf in positions:
+        if pos >= len(profiles) or pos >= width:
+            continue
+            
+        # Get neighboring columns for comparison
+        neighbors = []
+        for offset in [-4, -3, -2, -1, 1, 2, 3, 4]:
+            neighbor_pos = pos + offset
+            if 0 <= neighbor_pos < len(profiles):
+                neighbors.append(profiles[neighbor_pos])
+        
+        # Calculate correlations
+        correlations = []
+        target_profile = profiles[pos]
+        for neighbor in neighbors:
+            if len(neighbor) == len(target_profile):
+                corr = np.corrcoef(target_profile, neighbor)[0, 1]
+                if not np.isnan(corr):
+                    correlations.append(corr)
+        
+        # Check if this column is inconsistent with neighbors
+        if correlations and len(correlations) >= 4:
+            mean_corr = np.mean(correlations)
+            
+            # Lower correlation suggests a defect
+            if mean_corr < 0.85:
+                # Keep position but adjust confidence based on correlation
+                adjusted_conf = conf * (1.0 - mean_corr/2)
+                valid_positions.append((pos, adjusted_conf))
+            else:
+                # Likely false positive - very similar to neighbors
+                # Only keep if confidence is very high
+                if conf > 0.9:
+                    valid_positions.append((pos, conf * 0.8))
+        else:
+            # Not enough neighbors for comparison
+            valid_positions.append((pos, conf))
+    
+    return valid_positions
+
+def detect_defects_in_image(image, model, threshold, window_size=8, overlap=0.5, precision_mode=False):
     """Detect defects in an image with improved precision"""
     # Ensure image is properly normalized
     if image.max() > 1.0:
@@ -39,73 +142,132 @@ def detect_defects_in_image(image, model, threshold, window_size=8, overlap=0.5)
     
     # Extract features
     features = []
-    raw_features = []  # Store raw feature values for threshold adjustments
-    
     for window, pos in zip(windows, positions):
-        window_features = extract_window_features(window, norm_image, pos)
-        features.append(window_features)
-        raw_features.append(window_features)
+        try:
+            window_features = extract_window_features(window, norm_image, pos)
+            
+            # Validate features (check for NaN/inf)
+            if np.any(np.isnan(window_features)) or np.any(np.isinf(window_features)):
+                # Replace with zeros to avoid model errors
+                window_features = np.zeros_like(window_features)
+            
+            features.append(window_features)
+        except Exception as e:
+            print(f"Warning: Error extracting features at position {pos}: {e}")
+            # Add a placeholder of zeros
+            if len(features) > 0:
+                features.append(np.zeros_like(features[0]))
+            else:
+                # Make a reasonable guess at feature length
+                features.append(np.zeros(40))
     
     # Get predictions
     if len(features) > 0:
         X = np.array(features)
-        raw_X = np.array(raw_features)
+        
+        # Get probability predictions
         probas = model.predict_proba(X)[:, 1]
         
-        # Find defective elements with enhanced precision
-        defect_positions = []
+        # Initial confidence mapping
         element_probas = {}
-        
-        # Feature indices for adjustment (based on feature importance)
-        # These should be adjusted based on your actual feature importance
-        horizontal_uniformity_index = 16  # Main pattern uniformity feature
-        brightness_percentile_index = 5   # 90th percentile brightness
-        median_brightness_index = 3       # Median brightness
-        edge_distance_index = -1          # Position from edge (last contextual feature)
-        
         for i, ((start, end), proba) in enumerate(zip(positions, probas)):
-            adjusted_proba = proba
-            
-            # Only apply adjustments if we have enough features
-            if raw_X.shape[1] > max(horizontal_uniformity_index, brightness_percentile_index, 
-                                  median_brightness_index, abs(edge_distance_index)):
-                
-                # Penalize probabilities for suspicious feature values
-                if raw_X[i, horizontal_uniformity_index] < 0.05:  # Unusually uniform
-                    adjusted_proba *= 0.8  # Reduce confidence
-                    
-                # Adjust for very bright elements (often false positives)
-                if raw_X[i, brightness_percentile_index] > 0.9:  # Very bright
-                    adjusted_proba *= 0.85  # Reduce confidence
-                
-                # Adjust for edge proximity (if feature available)
-                if len(raw_X[i]) > abs(edge_distance_index) and raw_X[i][edge_distance_index] < 0.2:  # Close to edge
-                    adjusted_proba *= 0.9  # Reduce confidence
-            
-            # Apply to each position in the window
             for pos in range(start, end):
-                if pos not in element_probas or adjusted_proba > element_probas[pos]:
-                    element_probas[pos] = adjusted_proba
+                if pos not in element_probas or proba > element_probas[pos]:
+                    element_probas[pos] = proba
         
-        # Apply position-based threshold adjustments
+        # Apply strict position-based threshold adjustments
         image_width = roi.shape[1]
+        defect_positions = []
         
-        for pos, conf in list(element_probas.items()):
+        # Use higher threshold for precision mode
+        base_threshold = threshold * (1.15 if precision_mode else 1.0)
+        
+        for pos, conf in element_probas.items():
             # Determine adjusted threshold based on position
             if pos < 5 or pos > image_width - 5:  # Edge position
-                adjusted_threshold = threshold * 1.2  # Higher threshold at edges
+                adjusted_threshold = base_threshold * 1.4  # Much higher threshold at edges
             elif pos < 10 or pos > image_width - 10:  # Near edge
-                adjusted_threshold = threshold * 1.1  # Slightly higher threshold near edges
+                adjusted_threshold = base_threshold * 1.25  # Higher threshold near edges
+            elif pos < 15 or pos > image_width - 15:  # Somewhat near edge
+                adjusted_threshold = base_threshold * 1.15  # Slightly higher threshold
             else:
-                adjusted_threshold = threshold
+                adjusted_threshold = base_threshold
                 
             if conf >= adjusted_threshold:
                 defect_positions.append((pos, conf))
         
+        # Early return if no defects found
+        if not defect_positions:
+            return []
+        
+        # Sort by position for clustering analysis
+        defect_positions.sort(key=lambda x: x[0])
+        
+        # Cluster analysis to identify suspicious detection patterns
+        if precision_mode:
+            filtered_positions = []
+            
+            # Identify suspicious patterns (consecutive detections with identical confidence)
+            current_confidence = None
+            streak_start = -1
+            streak_length = 0
+            
+            for i, (pos, conf) in enumerate(defect_positions):
+                # Check if this is continuing a streak
+                if abs(conf - current_confidence) < 0.0001 and pos == defect_positions[i-1][0] + 1:
+                    streak_length += 1
+                else:
+                    # Process any streak that just ended
+                    if streak_length > 3:
+                        # For long identical confidence streaks, keep only the strongest point
+                        # Extract positions and intensities in the image
+                        streak_positions = [defect_positions[j][0] for j in range(streak_start, streak_start + streak_length)]
+                        
+                        # Extract intensity profile
+                        profile = extract_transducer_profile(norm_image)
+                        
+                        # Find the position with minimum intensity (likely the true defect)
+                        if all(p < len(profile) for p in streak_positions):
+                            intensities = [profile[p] for p in streak_positions]
+                            min_intensity_idx = streak_positions[np.argmin(intensities)]
+                            
+                            # Keep only that position
+                            filtered_positions.append((min_intensity_idx, current_confidence * 0.9))
+                    else:
+                        # For short streaks, keep all positions
+                        for j in range(streak_start, streak_start + streak_length):
+                            if j >= 0 and j < len(defect_positions):
+                                filtered_positions.append(defect_positions[j])
+                    
+                    # Start new streak
+                    streak_start = i
+                    streak_length = 1
+                    current_confidence = conf
+            
+            # Handle the final streak
+            if streak_length > 3:
+                # Similar processing for final streak
+                streak_positions = [defect_positions[j][0] for j in range(streak_start, streak_start + streak_length)]
+                profile = extract_transducer_profile(norm_image)
+                
+                if all(p < len(profile) for p in streak_positions):
+                    intensities = [profile[p] for p in streak_positions]
+                    min_intensity_idx = streak_positions[np.argmin(intensities)]
+                    filtered_positions.append((min_intensity_idx, current_confidence * 0.9))
+            else:
+                # For short streaks, keep all positions
+                for j in range(streak_start, streak_start + streak_length):
+                    if j >= 0 and j < len(defect_positions):
+                        filtered_positions.append(defect_positions[j])
+            
+            defect_positions = filtered_positions
+        
+        # Advanced filtering: Analyze pattern consistency
+        defect_positions = analyze_pattern_consistency(norm_image, defect_positions)
+        
         # Post-processing to remove isolated detections (likely false positives)
         if defect_positions:
             filtered_positions = []
-            defect_positions.sort(key=lambda x: x[0])  # Sort by position
             
             for i, (pos, conf) in enumerate(defect_positions):
                 # Check if this is an isolated detection
@@ -115,16 +277,30 @@ def detect_defects_in_image(image, model, threshold, window_size=8, overlap=0.5)
                         is_isolated = False
                         break
                 
-                # Keep non-isolated detections or very high confidence ones
-                if not is_isolated or conf > threshold * 1.5:
+                # Keep non-isolated detections or only very high confidence ones
+                if not is_isolated or conf > base_threshold * 1.5:
                     filtered_positions.append((pos, conf))
             
-            return filtered_positions
+            # If everything was filtered, keep the highest confidence detection
+            if not filtered_positions and defect_positions:
+                best_pos = max(defect_positions, key=lambda x: x[1])
+                filtered_positions.append(best_pos)
+            
+            # Final position refinement
+            profile = extract_transducer_profile(norm_image)
+            refined_positions = optimize_position_detection(
+                [p[0] for p in filtered_positions],
+                [p[1] for p in filtered_positions],
+                profile, 
+                window_size=window_size
+            )
+            
+            return refined_positions
     
     return []
 
 def main():
-    parser = argparse.ArgumentParser(description='Detect Defects in Ultrasound Transducer Image')
+    parser = argparse.ArgumentParser(description='Detect Defects in Ultrasound Transducer Image with Enhanced Precision')
     parser.add_argument('--model', type=str, default='defect_detection_model.pkl', help='Model file path')
     parser.add_argument('--data_file', type=str, required=True, help='HDF5 data file containing images for detection')
     parser.add_argument('--image_index', type=int, default=0, help='Index of the image to analyze in the dataset')
@@ -134,6 +310,10 @@ def main():
     parser.add_argument('--threshold', type=float, help='Custom threshold (overrides saved threshold)')
     parser.add_argument('--precision_mode', action='store_true', 
                       help='Enable precision mode (stricter detection criteria)')
+    parser.add_argument('--adjustment_factor', type=float, default=1.0,
+                      help='Adjust threshold by this factor (> 1.0 increases precision)')
+    parser.add_argument('--position_aware', action='store_true',
+                      help='Enable position-aware threshold adjustment')
     
     args = parser.parse_args()
     
@@ -144,6 +324,11 @@ def main():
     if args.threshold is not None:
         threshold = args.threshold
         print(f"Using custom threshold: {threshold}")
+    
+    # Apply adjustment factor
+    if args.adjustment_factor != 1.0:
+        threshold = threshold * args.adjustment_factor
+        print(f"Adjusted threshold: {threshold} (factor: {args.adjustment_factor})")
     
     # Load image from HDF5 file
     print(f"Loading image {args.image_index} from {args.data_file}")
@@ -164,11 +349,12 @@ def main():
             dead_elements = f['dead_elements'][args.image_index]
             true_defects = np.where(dead_elements > 0)[0].tolist()
     
-    # Detect defects
+    # Detect defects with precision mode (enabled by default for single image analysis)
     defect_positions = detect_defects_in_image(
         image, model, threshold, 
         window_size=args.window_size, 
-        overlap=args.overlap
+        overlap=args.overlap,
+        precision_mode=args.precision_mode
     )
     
     # Print results
