@@ -204,15 +204,19 @@ def detect_defects_in_image(image, model, threshold, window_size=8, overlap=0.5,
         defect_positions.sort(key=lambda x: x[0])
         
         # Cluster analysis to identify suspicious detection patterns
-        if precision_mode:
+        if precision_mode and len(defect_positions) > 1:
             filtered_positions = []
             
             # Identify suspicious patterns (consecutive detections with identical confidence)
-            current_confidence = None
-            streak_start = -1
-            streak_length = 0
+            current_confidence = defect_positions[0][1]  # Initialize with first confidence score
+            streak_start = 0
+            streak_length = 1
             
             for i, (pos, conf) in enumerate(defect_positions):
+                # Skip first element since we already initialized with it
+                if i == 0:
+                    continue
+                    
                 # Check if this is continuing a streak
                 if abs(conf - current_confidence) < 0.0001 and pos == defect_positions[i-1][0] + 1:
                     streak_length += 1

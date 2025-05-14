@@ -10,9 +10,6 @@ from collections import Counter
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import make_scorer, precision_score, recall_score, f1_score
-from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import RandomUnderSampler
-from imblearn.pipeline import Pipeline
 
 # Import from our modules
 from preprocessing import normalize_image, extract_roi, create_windows
@@ -66,33 +63,24 @@ def train_defect_detection_model(X_train, y_train, precision_focus=0.7):
     class_counts = Counter(y_train)
     print(f"Class distribution: {class_counts}")
     
-    # Calculate more aggressive class weights to reduce false positives
+    # Calculate aggressive class weights to reduce false positives
     # Higher weight for negative class reduces false positives
-    weight_ratio = 2.0 + 3.0 * precision_focus  # More aggressive weighting
+    weight_ratio = 5.0 + 5.0 * precision_focus
     class_weight = {
         0: weight_ratio,  # Much higher weight for negative class
         1: 1.0  # Normal weight for positive class
     }
     print(f"Using class weights: {class_weight}")
     
-    # Handle class imbalance with limited SMOTE
-    if class_counts[1] / sum(class_counts.values()) < 0.3:
-        # Use very limited oversampling for high precision
-        over = SMOTE(sampling_strategy=max(0.1, 0.3 - 0.2 * precision_focus), random_state=42)
-        under = RandomUnderSampler(sampling_strategy=0.35, random_state=42)
-        
-        steps = [('over', over), ('under', under)]
-        pipeline = Pipeline(steps=steps)
-        
-        X_train, y_train = pipeline.fit_resample(X_train, y_train)
-        print(f"After resampling: {Counter(y_train)}")
+    # NO resampling for high precision - just use the data as is
+    print("Using original data without resampling to preserve natural distribution")
     
     # Model with extreme precision-focused parameters
     rf = RandomForestClassifier(
-        n_estimators=800,         # More trees for better stability
-        max_depth=12,             # Reduced to avoid overfitting
-        min_samples_split=10,     # Increased to reduce false positives
-        min_samples_leaf=8,       # Increased to reduce false positives
+        n_estimators=1000,        # More trees for better stability
+        max_depth=10,             # Reduced to avoid overfitting
+        min_samples_split=15,     # Increased to reduce false positives
+        min_samples_leaf=10,      # Increased to reduce false positives
         max_features='sqrt',      # Reduces overfitting
         class_weight=class_weight,
         criterion='entropy',      # Better for imbalanced problems
@@ -103,7 +91,8 @@ def train_defect_detection_model(X_train, y_train, precision_focus=0.7):
     )
     
     # Custom scorer for extreme precision focus
-    beta = max(0.1, 0.3 - 0.2 * precision_focus)  # Adjust beta based on precision_focus
+    beta = max(0.1, 0.2 - 0.1 * precision_focus)  # Adjust beta based on precision_focus
+    print(f"Using F-beta score with beta={beta:.2f} (lower values prioritize precision)")
     
     def precision_focused_scorer(y_true, y_pred):
         return custom_precision_weighted_f1(y_true, y_pred, beta=beta)
@@ -112,10 +101,10 @@ def train_defect_detection_model(X_train, y_train, precision_focus=0.7):
     
     # Hyperparameter optimization with more extreme options
     param_grid = {
-        'n_estimators': [600, 800, 1000],
-        'max_depth': [10, 12, 15],
-        'min_samples_split': [8, 10, 15],
-        'min_samples_leaf': [6, 8, 10]
+        'n_estimators': [800, 1000, 1200],
+        'max_depth': [8, 10, 12],
+        'min_samples_split': [12, 15, 20],
+        'min_samples_leaf': [8, 10, 15]
     }
     
     # Use StratifiedKFold for imbalanced data
@@ -200,7 +189,7 @@ def find_precision_optimized_threshold(model, X_val, y_val, precision_focus=0.9)
     
     # Target minimum precision based on precision_focus
     # Higher precision_focus means higher target precision
-    min_precision_target = 0.7 + (0.25 * precision_focus)
+    min_precision_target = 0.85 + (0.14 * precision_focus)
     print(f"Target minimum precision: {min_precision_target:.4f}")
     
     # Find the threshold that gives at least the target precision
@@ -216,7 +205,7 @@ def find_precision_optimized_threshold(model, X_val, y_val, precision_focus=0.9)
         print(f"At this threshold - Precision: {precision[best_idx]:.4f}, Recall: {recall[best_idx]:.4f}")
     else:
         # If no threshold meets the precision requirement, choose a high threshold
-        optimal_threshold = 0.9
+        optimal_threshold = 0.95
         print(f"No threshold meets precision target. Using high threshold: {optimal_threshold:.4f}")
     
     # Plot precision-recall curve
