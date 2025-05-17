@@ -16,12 +16,16 @@ from visualization import visualize_defects
 from detect_image import detect_defects_in_image, load_model
 
 def calculate_metrics(predicted_defects, true_defects):
-    """Calculate precision, recall, F1"""
+    """Calculate precision, recall, F1 with improved handling of edge cases"""
     pred_positions = [pos for pos, _ in predicted_defects]
     
-    true_positives = len(set(pred_positions) & set(true_defects))
-    false_positives = len(set(pred_positions) - set(true_defects))
-    false_negatives = len(set(true_defects) - set(pred_positions))
+    # Convert to sets for more efficient intersection operations
+    pred_set = set(pred_positions)
+    true_set = set(true_defects)
+    
+    true_positives = len(pred_set & true_set)
+    false_positives = len(pred_set - true_set)
+    false_negatives = len(true_set - pred_set)
     
     precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
     recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
@@ -100,6 +104,8 @@ def main():
                       help='Adjust threshold by this factor (> 1.0 increases precision)')
     parser.add_argument('--sensitivity', choices=['high', 'medium', 'low'], default='medium',
                       help='Detection sensitivity: high (more defects), medium (balanced), low (fewer false positives)')
+    parser.add_argument('--strict_mode', action='store_true', 
+                      help='Enable strict mode for maximum precision')
     
     args = parser.parse_args()
     
@@ -108,11 +114,16 @@ def main():
         threshold_factor = max(0.8, args.adjustment_factor)
         precision_mode = False
     elif args.sensitivity == 'low':
-        threshold_factor = max(1.2, args.adjustment_factor)
+        threshold_factor = max(1.5, args.adjustment_factor)
         precision_mode = True
     else:  # medium
         threshold_factor = args.adjustment_factor
         precision_mode = args.precision_mode
+    
+    # Additional strictness for strict mode
+    if args.strict_mode:
+        threshold_factor *= 1.3
+        precision_mode = True
     
     # Load model
     model, threshold, model_data = load_model(args.model)
@@ -125,6 +136,7 @@ def main():
     threshold = threshold * threshold_factor
     print(f"Using threshold: {threshold:.4f} (adjustment factor: {threshold_factor:.2f})")
     print(f"Precision mode: {'Enabled' if precision_mode else 'Disabled'}")
+    print(f"Strict mode: {'Enabled' if args.strict_mode else 'Disabled'}")
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -179,6 +191,22 @@ def main():
                 overlap=args.overlap,
                 precision_mode=precision_mode
             )
+            
+            # Additional filtering in strict mode
+            if args.strict_mode and defect_positions:
+                # Keep only very high confidence detections
+                high_conf_positions = []
+                for pos, conf in defect_positions:
+                    if conf >= threshold * 1.2:
+                        high_conf_positions.append((pos, conf))
+                
+                # If filtering removed all detections but there were some before,
+                # keep the single highest confidence detection
+                if not high_conf_positions and defect_positions:
+                    best_position = max(defect_positions, key=lambda x: x[1])
+                    high_conf_positions = [best_position]
+                
+                defect_positions = high_conf_positions
             
             # Calculate metrics if ground truth available
             metrics = None
@@ -249,12 +277,13 @@ def main():
             'window_size': args.window_size,
             'overlap': args.overlap,
             'precision_mode': precision_mode,
+            'strict_mode': args.strict_mode,
+            'sensitivity': args.sensitivity,
+            'adjustment_factor': threshold_factor,
             'images_processed': end_idx - start_idx,
             'overall_metrics': overall_metrics if has_ground_truth else None,
             'image_results': results
         }
-        
-        results_filename = os.path.join(args.output_dir, 'detection_results.json')
         
         # Custom JSON encoder to handle numpy types
         class NumpyEncoder(json.JSONEncoder):
@@ -266,6 +295,8 @@ def main():
                 elif isinstance(obj, np.ndarray):
                     return obj.tolist()
                 return json.JSONEncoder.default(self, obj)
+        
+        results_filename = os.path.join(args.output_dir, 'detection_results.json')
         
         with open(results_filename, 'w') as f:
             json.dump(results_summary, f, indent=2, cls=NumpyEncoder)

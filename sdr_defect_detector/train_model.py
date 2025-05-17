@@ -9,13 +9,12 @@ import matplotlib.pyplot as plt
 from collections import Counter
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import make_scorer, precision_score, recall_score, f1_score
+from sklearn.metrics import make_scorer, precision_score, recall_score, f1_score, precision_recall_curve
 
 # Import from our modules
 from preprocessing import normalize_image, extract_roi, create_windows
-from feature_extraction import extract_window_features
-from evaluation import determine_optimal_threshold, evaluate_model, evaluate_element_level_performance
-from visualization import visualize_feature_importance
+from feature_extraction import extract_window_features, safe_correlation
+from visualization import visualize_feature_importance, visualize_precision_recall_curve
 
 def save_model(model, threshold, metrics, feature_importance=None, filename='defect_detection_model.pkl'):
     """Save trained model and related information"""
@@ -32,91 +31,63 @@ def save_model(model, threshold, metrics, feature_importance=None, filename='def
     
     print(f"Model saved to {filename}")
 
-def load_data_from_hdf5(filepath):
-    """Load image data and dead element information from HDF5 file"""
-    with h5py.File(filepath, 'r') as f:
-        # Load images
-        images = f['images'][:]
-        
-        # Load dead elements positions
-        dead_elements = f['dead_elements'][:]
-        
-        # Optionally load filenames if needed
-        filenames = f['filenames'][:] if 'filenames' in f else None
-        
-    return images, dead_elements, filenames
-
-def custom_precision_weighted_f1(y_true, y_pred, beta=0.2):
-    """Custom F-beta score with strong emphasis on precision"""
-    prec = precision_score(y_true, y_pred, zero_division=0)
-    rec = recall_score(y_true, y_pred, zero_division=0)
-    
-    # F-beta score formula (beta < 1 emphasizes precision)
-    # When beta=0.2, precision is weighted 25x more than recall
-    if (prec + rec) > 0:
-        return (1 + beta**2) * (prec * rec) / ((beta**2 * prec) + rec)
-    return 0
-
-def train_defect_detection_model(X_train, y_train, precision_focus=0.7):
-    """Train and optimize defect detection model with focus on precision"""
-    # Check for class imbalance
+def train_defect_detection_model(X_train, y_train, precision_focus=0.95):
+    """Train model with extreme precision focus"""
+    # Prepare for highly imbalanced data
     class_counts = Counter(y_train)
     print(f"Class distribution: {class_counts}")
     
-    # Calculate aggressive class weights to reduce false positives
-    # Higher weight for negative class reduces false positives
-    weight_ratio = 5.0 + 5.0 * precision_focus
+    # Set very aggressive class weights for precision
+    weight_ratio = 10.0 * precision_focus  # Much higher weight
     class_weight = {
-        0: weight_ratio,  # Much higher weight for negative class
-        1: 1.0  # Normal weight for positive class
+        0: weight_ratio,  # Very high weight for negative class
+        1: 1.0            # Normal weight for positive class
     }
     print(f"Using class weights: {class_weight}")
     
-    # NO resampling for high precision - just use the data as is
-    print("Using original data without resampling to preserve natural distribution")
-    
-    # Model with extreme precision-focused parameters
+    # Use more trees and stricter parameters
     rf = RandomForestClassifier(
-        n_estimators=1000,        # More trees for better stability
-        max_depth=10,             # Reduced to avoid overfitting
-        min_samples_split=15,     # Increased to reduce false positives
-        min_samples_leaf=10,      # Increased to reduce false positives
-        max_features='sqrt',      # Reduces overfitting
+        n_estimators=1500,        # More trees for stability
+        max_depth=8,              # Reduce depth to prevent overfitting
+        min_samples_split=25,     # Higher to reduce false positives
+        min_samples_leaf=15,      # Higher to reduce false positives
+        max_features='sqrt',      # Better for imbalanced data
         class_weight=class_weight,
-        criterion='entropy',      # Better for imbalanced problems
+        criterion='entropy',      # Better for imbalanced data
         bootstrap=True,
-        oob_score=True,           # Out-of-bag scoring
+        oob_score=True,
         n_jobs=-1,
         random_state=42
     )
     
-    # Custom scorer for extreme precision focus
-    beta = max(0.1, 0.2 - 0.1 * precision_focus)  # Adjust beta based on precision_focus
-    print(f"Using F-beta score with beta={beta:.2f} (lower values prioritize precision)")
-    
-    def precision_focused_scorer(y_true, y_pred):
-        return custom_precision_weighted_f1(y_true, y_pred, beta=beta)
-    
-    custom_scorer = make_scorer(precision_focused_scorer)
-    
-    # Hyperparameter optimization with more extreme options
-    param_grid = {
-        'n_estimators': [800, 1000, 1200],
-        'max_depth': [8, 10, 12],
-        'min_samples_split': [12, 15, 20],
-        'min_samples_leaf': [8, 10, 15]
-    }
-    
-    # Use StratifiedKFold for imbalanced data
-    from sklearn.model_selection import GridSearchCV, StratifiedKFold
+    # Use stratified k-fold for reliable validation
+    from sklearn.model_selection import StratifiedKFold, GridSearchCV
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    
+    # Custom F-beta with extreme precision preference (beta=0.1)
+    def precision_focused_score(y_true, y_pred):
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        beta = 0.1  # Very strong precision emphasis
+        if (prec + rec) > 0:
+            return (1 + beta**2) * (prec * rec) / ((beta**2 * prec) + rec)
+        return 0
+    
+    custom_scorer = make_scorer(precision_focused_score)
+    
+    # Hyperparameter optimization with more extreme values
+    param_grid = {
+        'n_estimators': [1200, 1500, 1800],
+        'min_samples_split': [20, 25, 30],
+        'min_samples_leaf': [10, 15, 20],
+    }
     
     grid_search = GridSearchCV(
         rf, param_grid, cv=cv, scoring=custom_scorer, n_jobs=-1, verbose=1
     )
     
     # Train the model
-    print("Training model with precision focus...")
+    print("Training model with extreme precision focus...")
     grid_search.fit(X_train, y_train)
     
     # Get best model
@@ -179,8 +150,6 @@ def enhanced_calibration_for_precision(model, X_val, y_val, precision_focus=0.9)
 
 def find_precision_optimized_threshold(model, X_val, y_val, precision_focus=0.9):
     """Find threshold optimized for high precision"""
-    from sklearn.metrics import precision_recall_curve
-    
     # Get predicted probabilities
     y_proba = model.predict_proba(X_val)[:, 1]
     
@@ -209,23 +178,8 @@ def find_precision_optimized_threshold(model, X_val, y_val, precision_focus=0.9)
         print(f"No threshold meets precision target. Using high threshold: {optimal_threshold:.4f}")
     
     # Plot precision-recall curve
-    plt.figure(figsize=(10, 8))
-    plt.plot(recall, precision, marker='.', linewidth=1)
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.axhline(y=min_precision_target, color='r', linestyle='--', label=f'Target Precision ({min_precision_target:.2f})')
-    
-    # Mark the selected threshold
-    for i, t in enumerate(thresholds):
-        if abs(t - optimal_threshold) < 0.01:
-            plt.plot(recall[i], precision[i], 'ro', markersize=8, 
-                     label=f'Selected Threshold: {optimal_threshold:.2f}')
-            break
-    
-    plt.title('Precision-Recall Curve')
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.savefig('precision_recall_curve.png')
+    fig = visualize_precision_recall_curve(precision, recall, thresholds, threshold=optimal_threshold)
+    fig.savefig('precision_recall_curve.png')
     plt.close()
     
     print("Precision-recall curve saved to 'precision_recall_curve.png'")
@@ -233,7 +187,7 @@ def find_precision_optimized_threshold(model, X_val, y_val, precision_focus=0.9)
     return optimal_threshold
 
 def extract_features_with_validation(image, defects, window_size=8, overlap=0.5):
-    """Extract features with validation for NaN and invalid values"""
+    """Extract features with improved validation for NaN and invalid values"""
     # Preprocess
     if image.max() > 1.0:
         norm_image = normalize_image(image)
@@ -250,22 +204,135 @@ def extract_features_with_validation(image, defects, window_size=8, overlap=0.5)
     valid_indices = []
     
     for i, (window, (start, end)) in enumerate(zip(windows, positions)):
-        # Extract features
-        window_features = extract_window_features(window, norm_image, (start, end))
-        
-        # Validate features - check for NaN or inf
-        if np.any(np.isnan(window_features)) or np.any(np.isinf(window_features)):
+        try:
+            # Extract features
+            window_features = extract_window_features(window, norm_image, (start, end))
+            
+            # Validate features - check for NaN or inf
+            window_features = np.array(window_features)
+            if np.any(np.isnan(window_features)) or np.any(np.isinf(window_features)):
+                # Replace NaN/inf with zeros
+                window_features[np.isnan(window_features)] = 0
+                window_features[np.isinf(window_features)] = 0
+            
+            features.append(window_features)
+            
+            # Determine label
+            is_defective = any(start <= pos < end for pos in defects)
+            labels.append(1 if is_defective else 0)
+            valid_indices.append(i)
+        except Exception as e:
             # Skip this window
             continue
-        
-        features.append(window_features)
-        
-        # Determine label
-        is_defective = any(start <= pos < end for pos in defects)
-        labels.append(1 if is_defective else 0)
-        valid_indices.append(i)
     
     return features, labels, valid_indices
+
+def evaluate_model(model, threshold, X_test, y_test):
+    """Evaluate model performance with the optimal threshold"""
+    # Get predictions
+    y_proba = model.predict_proba(X_test)[:, 1]
+    y_pred = (y_proba >= threshold).astype(int)
+    
+    # Calculate metrics
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    
+    print(f"Test set performance:")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
+
+def evaluate_element_level_performance(model, threshold, test_images, true_defect_positions):
+    """Evaluate model performance at element level"""
+    all_true_positions = []
+    all_pred_positions = []
+    
+    for i, (image, true_positions) in enumerate(zip(test_images, true_defect_positions)):
+        # Process image
+        if image.max() > 1.0:
+            norm_image = normalize_image(image)
+        else:
+            norm_image = (image * 255).astype(np.uint8)
+            
+        roi = extract_roi(norm_image)
+        
+        # Create windows
+        windows, positions = create_windows(roi, window_size=8, overlap=0.5)
+        
+        # Extract features
+        features = []
+        valid_positions = []
+        
+        for window, pos in zip(windows, positions):
+            try:
+                window_features = extract_window_features(window, norm_image, pos)
+                
+                # Validate features
+                window_features = np.array(window_features)
+                if not np.any(np.isnan(window_features)) and not np.any(np.isinf(window_features)):
+                    features.append(window_features)
+                    valid_positions.append(pos)
+                else:
+                    # Fix invalid values
+                    window_features[np.isnan(window_features)] = 0
+                    window_features[np.isinf(window_features)] = 0
+                    features.append(window_features)
+                    valid_positions.append(pos)
+            except Exception as e:
+                # Skip problematic features
+                continue
+        
+        # Get predictions if we have features
+        if len(features) > 0:
+            X = np.array(features)
+            
+            try:
+                # Get probability predictions
+                probas = model.predict_proba(X)[:, 1]
+                
+                # Apply threshold and handle overlapping windows
+                element_probas = {}
+                for (start, end), proba in zip(valid_positions, probas):
+                    for pos in range(start, end):
+                        if pos not in element_probas or proba > element_probas[pos]:
+                            element_probas[pos] = proba
+                
+                # Get predicted defect positions
+                pred_positions = [pos for pos, prob in element_probas.items() if prob >= threshold]
+                
+                # Add to overall lists
+                all_true_positions.extend([(i, pos) for pos in true_positions])
+                all_pred_positions.extend([(i, pos) for pos in pred_positions])
+            except Exception as e:
+                print(f"Error evaluating image {i}: {e}")
+                continue
+    
+    # Calculate element-level metrics
+    true_positives = len(set(all_true_positions) & set(all_pred_positions))
+    false_positives = len(set(all_pred_positions) - set(all_true_positions))
+    false_negatives = len(set(all_true_positions) - set(all_pred_positions))
+    
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    print(f"Element-level metrics:")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
 
 def main():
     # Parse command line arguments
@@ -274,18 +341,39 @@ def main():
     parser.add_argument('--output', type=str, default='defect_detection_model.pkl', help='Output model filename')
     parser.add_argument('--window_size', type=int, default=8, help='Window size for feature extraction')
     parser.add_argument('--overlap', type=float, default=0.5, help='Window overlap ratio')
-    parser.add_argument('--precision_focus', type=float, default=0.9, 
+    parser.add_argument('--precision_focus', type=float, default=0.95, 
                        help='Focus on precision (0-1, higher values prioritize precision over recall)')
     parser.add_argument('--save_vis', action='store_true', help='Save visualization of feature importance')
+    parser.add_argument('--extreme_precision', action='store_true', help='Use extreme precision settings')
     
     args = parser.parse_args()
+    
+    # Adjust precision focus if extreme mode requested
+    if args.extreme_precision:
+        precision_focus = 0.98
+        print(f"Using extreme precision settings (precision_focus = {precision_focus})")
+    else:
+        precision_focus = args.precision_focus
     
     # Create output directory
     os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else '.', exist_ok=True)
     
     # Load data from HDF5 file
     print(f"Loading dataset from HDF5 file: {args.data_file}...")
-    images, dead_elements, filenames = load_data_from_hdf5(args.data_file)
+    try:
+        with h5py.File(args.data_file, 'r') as f:
+            # Load images
+            images = f['images'][:]
+            
+            # Load dead elements
+            if 'dead_elements' in f:
+                dead_elements = f['dead_elements'][:]
+            else:
+                print("Error: No 'dead_elements' dataset found in HDF5 file")
+                return
+    except Exception as e:
+        print(f"Error loading HDF5 file: {e}")
+        return
     
     print(f"Dataset: {len(images)} images")
     
@@ -355,10 +443,10 @@ def main():
     print(f"Positive samples: {np.sum(y_train)} ({np.sum(y_train)/len(y_train)*100:.2f}%)")
     
     # Train model
-    print(f"Training model with precision_focus={args.precision_focus}...")
+    print(f"Training model with precision_focus={precision_focus}...")
     model, feature_importance = train_defect_detection_model(
         X_train, y_train, 
-        precision_focus=args.precision_focus
+        precision_focus=precision_focus
     )
     
     # Extract validation features
@@ -384,14 +472,14 @@ def main():
     print("Calibrating model probabilities...")
     calibrated_model = enhanced_calibration_for_precision(
         model, X_val, y_val, 
-        precision_focus=args.precision_focus
+        precision_focus=precision_focus
     )
     
     # Find precision-optimized threshold
     print("Finding precision-optimized threshold...")
     optimal_threshold = find_precision_optimized_threshold(
         calibrated_model, X_val, y_val, 
-        precision_focus=args.precision_focus
+        precision_focus=precision_focus
     )
     
     # Evaluate on test set
@@ -423,9 +511,7 @@ def main():
         calibrated_model, 
         optimal_threshold, 
         test_images, 
-        test_defects,
-        lambda x: normalize_image(x) if x.max() > 1.0 else (x * 255).astype(np.uint8),
-        extract_window_features
+        test_defects
     )
     
     # Visualize feature importance
